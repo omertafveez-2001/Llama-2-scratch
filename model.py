@@ -52,7 +52,19 @@ def precompute_theta_cos_frequencies(head_dim: int, seq_len: int, device: str, t
 
     return freqs_complex
 
+def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+    # (B, seqlen, H, head_dim) -> (B, seqlen, H, head_dim/2)
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    # (1, seqlen, 1, head_dim/2) -> adding dimensions to freqs_complex
+    freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(0)
+    # (B, Seq_len, H, Head_dim/2) * (1, Seq_len, 1, Head_dim/2) -> (B, Seq_len, H, Head_dim/2)
+    x_rotated = x_complex * freqs_complex
+    # (B, Seq_len, H, Head_dim/2) -> (B, Seq_len, H, Head_dim/2, 2)
+    x_out = torch.view_as_real(x_rotated)
+    #(B, Seq_len, H, Head_dim/2, 2) -> (B, Seq_len, H, Head_dim)
+    x_out = x_out.reshape(*x.shape)
 
+    return x_out.type_as(x).to(device)
 
 class Transformer(nn.Module):
     
@@ -93,3 +105,155 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h)
         return output
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+        # gamma parameter
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def norm(self, x:torch.Tensor):
+        # (B, Seq_len, dim)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x: torch.Tensor):
+        # (Dim) * (B, Seq_len, dim) -> (B, Seq_len, dim)
+        return self.weight * self.norm(x.float()).type_as(x)
+
+class EncoderBlock(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = self.dim // self.n_heads
+
+        self.attention = SelfAttention(args)
+        self.feed_forward = FeedForward(args)
+
+        self.attention_norm = RMSNorm(self.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(self.dim, eps=args.norm_eps)
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+        # (B, Seq_len, dim)
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape
+
+    if n_rep == 1:
+        return x
+    else:
+        return (
+            # (B, Seq_len, n_kv_heads, 1, head_dim)
+            x[:, :, :, None, :]
+            .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+            .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
+        )
+    
+class SelfAttention(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        # indicates the number of heads for the Key and Values
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # indicates the number of heads for the Queries
+        self.n_heads_q = args.n_heads
+        # indicates how many times the Keys and Values should be repeated to match the head of the Queries.
+        self.n_rep = self.n_heads_q // self.n_kv_heads
+        # indicates the dimension of each head
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+        batch_size, seq_len, _ = x.shape # (B, 1, Dim)
+
+        # (B, 1, Dim) -> (B, 1, n_heads * head_dim)
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        # (B, 1, n_heads * head_dim) -> (B, 1, n_heads, head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+
+        # Does not change the shape of the vectors.
+        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
+        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
+
+        # Replace the entry int he cache for this token. 
+        self.cache_k[:batch_size, start_pos:start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos:start_pos + seq_len] = xv
+
+        # Retrieve all the caches keys and values so far
+        # (B, Seq_len_kv, n_kv_heads, head_dim)
+        keys = self.cache_k[:batch_size, :start_pos + seq_len]
+        values = self.cache_v[:batch_size, :start_pos + seq_len]
+
+        # repear the heads of the K and V to reach the number of heads of the queries.
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
+
+        # (B, Seq_len, n_heads, head_dim) -> (B, n_heads, Seq_len, head_dim)
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len) --> (B, H_Q, 1, Seq_Len)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        output = torch.matmul(scores, values)
+        # (B, H_Q, 1, Head_Dim) -> (B, 1, H_Q, Head_Dim) --> (B, 1, H_Q * Head_Dim)
+        output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
+        return self.wo(output) # (B, 1, Dim) --> (B, 1, Dim)
+    
+
+class FeedForward(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        # increase the size of the model (increase parameters) since we decrease the number of heads using GQA.
+        hidden_dim = 4 * args.dim
+        hidden_dim = int(2 * hidden_dim /3)
+        if args.ffn_dim_multiplier is not None:
+            hidden_dim = int(args.ffn_dim_multiplier * args.dim)
+        
+        # Round the hidden dim to the nearest multiple of the multiple_of parameter to ensure that it is the multiple of the parameter.
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of -1) // args.multiple_of)
+        # hidden_size = 7, multiple of = 5
+        # (7 + 4) // 5 = 2 
+        # 2 * 5 = 10 (multiple of 5)
+
+        # SwiGLU 
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
+    
+    def forward(self, x: torch.Tensor):
+        swish = F.silu(self.w1(x))
+        x_V = self.w3(x)
+        x = swish * x_V
+        x = self.w2(x)
+        return x
+
+
+
+        
+
+
