@@ -1,4 +1,4 @@
-# Llama-2-scratch
+# LLaMa-2 Implementation from Scratch.
 
 ## Transformer vs LLaMa
 <img src="images/transformervsllama.png" alt="Transformer Architecture" width="650"/>
